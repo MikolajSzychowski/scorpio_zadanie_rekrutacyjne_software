@@ -3,7 +3,5 @@
 #   X, Y, Z    - współrzędne celu w przestrzeni 3D
 # Puste linie i wszystko po # jest ignorowane.
 
-0 1 1 0     # od razu po starcie
-15 1 10 10    # po kolejnych 10 sekundach
-15 -1 0 0    # po kolejnej sekundzie
-15 -12 1 0     # po kolejnych 3 sekundach
+0 5 0 5
+10 -5 0 5

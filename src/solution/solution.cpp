@@ -8,13 +8,11 @@
 #include <algorithm>
 #include <queue>
 
-//ros2 launch scorpio_zadanie_rekrutacyjne_software platform.launch.py input_file:=src/commands.txt
-
 namespace solution 
 {
   static constexpr int ENCODER_RESOLUTION = 4096;
-  static constexpr int ALLOWED_ROTATION_ERROR = 2;
-
+  static constexpr int ALLOWED_ROTATION_ERROR = 10;
+  static constexpr bool CONSTRAINT_CAMERA_UP = false;
   struct Pid 
   {
     double kp = 0.1, ki = 0.0, kd = 0.0;
@@ -56,24 +54,27 @@ public:
   explicit Solution(const rclcpp::NodeOptions& options = rclcpp::NodeOptions()) : rclcpp::Node("solution", options) {
 
     // Short example you can remove it
-    const auto preempt = declare_parameter<bool>("preempt", false);
+    preempt = declare_parameter<bool>("preempt", false);
     RCLCPP_INFO(get_logger(), "%s", preempt ? "Preempt" : "Queue");
 
-    //std::cout << std::atan2(5, 5) << " " << std::atan2(5, -5) << " " << std::atan2(-5, 5) << " " << std::atan2(-5, -5) << std::endl;
     _motor1 = create_publisher<std_msgs::msg::Int8>("motor_1/control", rclcpp::QoS(rclcpp::KeepLast(10)).reliable().transient_local());
     _motor2 = create_publisher<std_msgs::msg::Int8>("motor_2/control", rclcpp::QoS(rclcpp::KeepLast(10)).reliable().transient_local());
 
     _encoder1 = create_subscription<std_msgs::msg::UInt16>("motor_1/encoder", rclcpp::QoS(rclcpp::KeepLast(10)).reliable(),
       [this](const std_msgs::msg::UInt16 reading) 
     {
-      //std::cout << "Encoder 1: " << reading.data << std::endl;
       encoder_1_reading = reading.data;
-      if (!has_target) return;
+      check_reached();
 
-      const int error = shortest_error(target_encoder_yaw, encoder_1_reading);
       std_msgs::msg::Int8 command;
+      command.data = 0;
 
-      command.data = (std::abs(error) <= ALLOWED_ROTATION_ERROR) ? 0 : to_command(pid_yaw.update(error, now()));
+      if (!target_queue.empty())
+      {
+        const int error = shortest_error(target_queue.front().first, encoder_1_reading);
+        command.data = (std::abs(error) <= ALLOWED_ROTATION_ERROR) ? 0 : to_command(pid_yaw.update(error, now()));
+      }
+      
       _motor1->publish(command);
 
     });
@@ -81,14 +82,18 @@ public:
     _encoder2 = create_subscription<std_msgs::msg::UInt16>("motor_2/encoder", rclcpp::QoS(rclcpp::KeepLast(10)).reliable(),
       [this](const std_msgs::msg::UInt16 reading) 
     {
-      //std::cout << "Encoder 2: " << reading.data << std::endl;
       encoder_2_reading = reading.data;
-      if (!has_target) return;
+      check_reached();
 
-      const int error = shortest_error(target_encoder_pitch, encoder_2_reading);
       std_msgs::msg::Int8 command;
+      command.data = 0;
 
-      command.data = (std::abs(error) <= ALLOWED_ROTATION_ERROR) ? 0 : to_command(pid_pitch.update(error, now()));
+      if (!target_queue.empty())
+      {
+        const int error = shortest_error(target_queue.front().second, encoder_2_reading);
+        command.data = (std::abs(error) <= ALLOWED_ROTATION_ERROR) ? 0 : to_command(pid_pitch.update(error, now()));
+      }
+   
       _motor2->publish(command);
 
     });
@@ -97,14 +102,8 @@ public:
         [this](const geometry_msgs::msg::Point::SharedPtr point) 
       {
         RCLCPP_INFO(get_logger(), "Target: (%g, %g, %g)", point->x, point->y, point->z);
-        has_target = true;
-
-        //std::cout << "New target: " << point->x << " " << point->y << " " << point->z << std::endl;
 
         calculate_target_rotation(point->x, point->y, point->z);
-
-        pid_yaw.reset();
-        pid_pitch.reset();
       });
   }
 
@@ -115,10 +114,21 @@ private:
   rclcpp::Subscription<std_msgs::msg::UInt16>::SharedPtr _encoder2;
   rclcpp::Subscription<geometry_msgs::msg::Point>::SharedPtr _target;
   int target_encoder_yaw = 0, target_encoder_pitch = 0, encoder_1_reading = 0, encoder_2_reading = 0;
-  bool has_target = false;
   Pid pid_yaw{2.0, 0.01, 0.001};
   Pid pid_pitch{2.0, 0.01, 0.001};
   std::queue<std::pair<int, int>> target_queue;
+  bool preempt = false;
+
+  void check_reached()
+  {
+    if (target_queue.size() < 2) return; 
+    if (std::abs(shortest_error(target_queue.front().first, encoder_1_reading)) > ALLOWED_ROTATION_ERROR) return;
+    if (std::abs(shortest_error(target_queue.front().second, encoder_2_reading)) > ALLOWED_ROTATION_ERROR) return;
+
+    target_queue.pop();
+    pid_yaw.reset();
+    pid_pitch.reset();
+  }
 
   void calculate_target_rotation(double x, double y, double z)
   {
@@ -127,36 +137,51 @@ private:
       return;   
     }
 
+    const std::pair<int, int> start_point = target_queue.empty() || preempt ? std::make_pair(encoder_1_reading, encoder_2_reading) : target_queue.back();
+
     double h = std::hypot(x, y);
 
     const double yaw = std::atan2(-y, x); 
     const double pitch = std::atan2(z, h);
 
-    int yaw_a = h < 1e-9 ? encoder_1_reading : angle_to_encoder(yaw);
+    int yaw_a = h < 1e-9 ? start_point.first : angle_to_encoder(yaw);
     int pitch_a = angle_to_encoder(pitch);
 
-    int yaw_b = h < 1e-9 ? encoder_1_reading : angle_to_encoder(yaw + M_PI);
+    int yaw_b = h < 1e-9 ? start_point.first : angle_to_encoder(yaw + M_PI);
     int pitch_b = angle_to_encoder(M_PI - pitch);
 
 
-    int error_a = std::max(std::abs(shortest_error(yaw_a, encoder_1_reading)), std::abs(shortest_error(pitch_a, encoder_2_reading)));
-    int error_b = std::max(std::abs(shortest_error(yaw_b, encoder_1_reading)), std::abs(shortest_error(pitch_b, encoder_2_reading)));
+    int error_a = std::max(std::abs(shortest_error(yaw_a, start_point.first)), std::abs(shortest_error(pitch_a, start_point.second)));
+    int error_b = std::max(std::abs(shortest_error(yaw_b, start_point.first)), std::abs(shortest_error(pitch_b, start_point.second)));
+
+    if(CONSTRAINT_CAMERA_UP)
+    {
+      error_b = error_a;
+    }
+
+    if(preempt)
+    {
+      while(!target_queue.empty())
+      {
+        target_queue.pop();
+      }
+    }
+
+    if(target_queue.empty())
+    {
+      pid_yaw.reset();
+      pid_pitch.reset();
+    }
 
     if(error_a <= error_b)
     {
-      target_encoder_yaw = yaw_a;
-      target_encoder_pitch = pitch_a;
+      target_queue.push({yaw_a, pitch_a});
     }
     else
     {
-      target_encoder_yaw = yaw_b;
-      target_encoder_pitch = pitch_b;
+      target_queue.push({yaw_b, pitch_b});
     }
-
-
-    
-
-    RCLCPP_INFO(get_logger(), "Encoder target: yaw=%d pitch=%d",target_encoder_yaw, target_encoder_pitch);
+    RCLCPP_INFO(get_logger(), "Encoder target: yaw=%d pitch=%d",target_queue.back().first, target_queue.back().second);
   }
 
   int reduce_to_encoder(int value)
