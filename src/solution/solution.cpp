@@ -207,4 +207,5 @@ private:
 
 }  // namespace solution
 
+
 RCLCPP_COMPONENTS_REGISTER_NODE(solution::Solution)
